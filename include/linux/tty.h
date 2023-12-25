@@ -14,7 +14,6 @@
 #include <linux/rwsem.h>
 #include <linux/llist.h>
 
-
 /*
  * Lock subclasses for tty locks
  *
@@ -305,6 +304,10 @@ struct tty_struct {
 	struct termiox *termiox;	/* May be NULL for unsupported */
 	char name[64];
 	struct pid *pgrp;		/* Protected by ctrl lock */
+	/*
+	 * Writes protected by both ctrl lock and legacy mutex, readers must use
+	 * at least one of them.
+	 */
 	struct pid *session;
 	unsigned long flags;
 	int count;
@@ -324,6 +327,10 @@ struct tty_struct {
 	wait_queue_head_t write_wait;
 	wait_queue_head_t read_wait;
 	struct work_struct hangup_work;
+#if defined(CONFIG_TTY_FLUSH_LOCAL_ECHO)
+	int delayed_work;
+	struct delayed_work echo_delayed_work;
+#endif
 	void *disc_data;
 	void *driver_data;
 	spinlock_t files_lock;		/* protects tty_files list */
@@ -780,6 +787,10 @@ extern void proc_tty_unregister_driver(struct tty_driver *);
 #else
 static inline void proc_tty_register_driver(struct tty_driver *d) {}
 static inline void proc_tty_unregister_driver(struct tty_driver *d) {}
+#endif
+
+#ifdef CONFIG_MODS_NEW_SW_ARCH
+extern void release_tty(struct tty_struct *tty, int idx);
 #endif
 
 #define tty_msg(fn, tty, f, ...) \

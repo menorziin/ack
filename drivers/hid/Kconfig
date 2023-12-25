@@ -1047,6 +1047,20 @@ config HID_ALPS
 	Say Y here if you have a Alps touchpads over i2c-hid or usbhid
 	and want support for its special functionalities.
 
+config HID_QVR
+	tristate "QVR support"
+	depends on HID
+	---help---
+	Say 'Y' or 'M' if you want to connect an external device to
+	stream sensor data for QVR support.
+
+config HID_MOTOROLA_MODS
+	tristate "MOTOROLA MODS support" if EXPERT
+	depends on HID
+	default !EXPERT
+	---help---
+	Support Motorola Mods Hid devices
+
 endmenu
 
 endif # HID

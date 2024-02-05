@@ -28,12 +28,20 @@
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
 #include <linux/ftrace.h>
+#include <linux/rtc.h>
 #include <trace/events/power.h>
 #include <linux/compiler.h>
 #include <linux/moduleparam.h>
 #include <linux/wakeup_reason.h>
-
 #include "power.h"
+#include <soc/qcom/boot_stats.h>
+#ifdef CONFIG_MSM_RPM_STATS_LOG
+extern void msm_rpmstats_log_suspend_enter(void);
+extern void msm_rpmstats_log_suspend_exit(int error);
+#endif
+#ifdef CONFIG_SUSPEND_DEBUG
+#include "user_sysfs_private.h"
+#endif
 
 const char * const pm_labels[] = {
 	[PM_SUSPEND_TO_IDLE] = "freeze",
@@ -432,6 +440,12 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	if (suspend_test(TEST_PLATFORM))
 		goto Platform_wake;
 
+#ifdef CONFIG_SUSPEND_DEBUG
+	vreg_before_sleep_save_configs();
+	tlmm_before_sleep_set_configs();
+	tlmm_before_sleep_save_configs();
+#endif
+
 	error = disable_nonboot_cpus();
 	if (error || suspend_test(TEST_CPUS)) {
 		log_suspend_abort_reason("Disabling non-boot cpus failed");
@@ -448,6 +462,7 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 			trace_suspend_resume(TPS("machine_suspend"),
 				state, true);
 			error = suspend_ops->enter(state);
+			update_marker("M - Start System Resume");
 			trace_suspend_resume(TPS("machine_suspend"),
 				state, false);
 		} else if (*wakeup) {
@@ -542,6 +557,59 @@ static void suspend_finish(void)
 	pm_notifier_call_chain(PM_POST_SUSPEND);
 	pm_restore_console();
 }
+/**
+ * Sync the filesystem in seperate workqueue.
+ * Then check it finishing or not periodically and
+ * abort if any wakeup source comes in. That can reduce
+ * the wakeup latency
+ *
+ */
+#define SYS_SYNC_TIMEOUT 1000
+static bool sys_sync_completed = false;
+static void sys_sync_work_func(struct work_struct *work);
+static DECLARE_WORK(sys_sync_work, sys_sync_work_func);
+static DECLARE_WAIT_QUEUE_HEAD(sys_sync_wait);
+static void sys_sync_work_func(struct work_struct *work)
+{
+	pr_info("PM: Syncing filesystems ... \n");
+	sys_sync();
+	sys_sync_completed = true;
+	wake_up(&sys_sync_wait);
+}
+
+static int sys_sync_queue(void)
+{
+	int work_status = work_busy(&sys_sync_work);
+
+	/*Check if the previous work still running.*/
+	if (!(work_status & WORK_BUSY_PENDING)) {
+		if (work_status & WORK_BUSY_RUNNING) {
+			while (wait_event_timeout(sys_sync_wait, sys_sync_completed,
+						msecs_to_jiffies(SYS_SYNC_TIMEOUT)) == 0) {
+				if (pm_wakeup_pending()) {
+					pr_info("PM: Pre-Syncing abort\n");
+					goto abort;
+				}
+			}
+			pr_info("PM: Pre-Syncing done\n");
+		}
+		sys_sync_completed = false;
+		schedule_work(&sys_sync_work);
+	}
+
+	while (wait_event_timeout(sys_sync_wait, sys_sync_completed,
+					msecs_to_jiffies(SYS_SYNC_TIMEOUT)) == 0) {
+		if (pm_wakeup_pending()) {
+			pr_info("PM: Syncing abort\n");
+			goto abort;
+		}
+	}
+
+	pr_info("PM: Syncing done\n");
+	return 0;
+abort:
+	return -EAGAIN;
+}
 
 /**
  * enter_state - Do common work needed to enter system sleep state.
@@ -574,9 +642,9 @@ static int enter_state(suspend_state_t state)
 
 #ifndef CONFIG_SUSPEND_SKIP_SYNC
 	trace_suspend_resume(TPS("sync_filesystems"), 0, true);
-	pr_info("Syncing filesystems ... ");
-	sys_sync();
-	pr_cont("done.\n");
+	error = sys_sync_queue();
+	if (error)
+		goto Unlock;
 	trace_suspend_resume(TPS("sync_filesystems"), 0, false);
 #endif
 
@@ -604,6 +672,18 @@ static int enter_state(suspend_state_t state)
 	return error;
 }
 
+static void pm_suspend_marker(char *annotation)
+{
+	struct timespec ts;
+	struct rtc_time tm;
+
+	getnstimeofday(&ts);
+	rtc_time_to_tm(ts.tv_sec, &tm);
+	pr_info("PM: suspend %s %d-%02d-%02d %02d:%02d:%02d.%09lu UTC\n",
+		annotation, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+		tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec);
+}
+
 /**
  * pm_suspend - Externally visible function for suspending the system.
  * @state: System sleep state to enter.
@@ -618,7 +698,11 @@ int pm_suspend(suspend_state_t state)
 	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
 		return -EINVAL;
 
+	pm_suspend_marker("entry");
 	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
+#ifdef CONFIG_MSM_RPM_STATS_LOG
+	msm_rpmstats_log_suspend_enter();
+#endif
 	error = enter_state(state);
 	if (error) {
 		suspend_stats.fail++;
@@ -626,7 +710,12 @@ int pm_suspend(suspend_state_t state)
 	} else {
 		suspend_stats.success++;
 	}
+#ifdef CONFIG_MSM_RPM_STATS_LOG
+	msm_rpmstats_log_suspend_exit(error);
+#endif
+	pm_suspend_marker("exit");
 	pr_info("suspend exit\n");
+	measure_wake_up_time();
 	return error;
 }
 EXPORT_SYMBOL(pm_suspend);

@@ -136,8 +136,12 @@ EXPORT_SYMBOL(tty_std_termios);
 
 LIST_HEAD(tty_drivers);			/* linked list of tty drivers */
 
+EXPORT_SYMBOL(tty_drivers);
+
 /* Mutex to protect creating and releasing a tty */
 DEFINE_MUTEX(tty_mutex);
+
+EXPORT_SYMBOL(tty_mutex);
 
 static ssize_t tty_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t tty_write(struct file *, const char __user *, size_t, loff_t *);
@@ -154,7 +158,11 @@ static long tty_compat_ioctl(struct file *file, unsigned int cmd,
 #endif
 static int __tty_fasync(int fd, struct file *filp, int on);
 static int tty_fasync(int fd, struct file *filp, int on);
+#ifdef CONFIG_MODS_NEW_SW_ARCH
+void release_tty(struct tty_struct *tty, int idx);
+#else
 static void release_tty(struct tty_struct *tty, int idx);
+#endif
 
 /**
  *	free_tty_struct		-	free a disused tty
@@ -1380,6 +1388,7 @@ err_release_lock:
 	release_tty(tty, idx);
 	return ERR_PTR(retval);
 }
+EXPORT_SYMBOL(tty_init_dev);
 
 static void tty_free_termios(struct tty_struct *tty)
 {
@@ -1492,7 +1501,11 @@ EXPORT_SYMBOL(tty_kref_put);
  *	of ttys that the driver keeps.
  *
  */
+#ifdef CONFIG_MODS_NEW_SW_ARCH
+void release_tty(struct tty_struct *tty, int idx)
+#else
 static void release_tty(struct tty_struct *tty, int idx)
+#endif
 {
 	/* This should always be true but check for the moment */
 	WARN_ON(tty->index != idx);
@@ -1511,6 +1524,9 @@ static void release_tty(struct tty_struct *tty, int idx)
 	tty_kref_put(tty->link);
 	tty_kref_put(tty);
 }
+#ifdef CONFIG_MODS_NEW_SW_ARCH
+EXPORT_SYMBOL(release_tty);
+#endif
 
 /**
  *	tty_release_checks - check a tty before real release
@@ -2739,10 +2755,14 @@ void __do_SAK(struct tty_struct *tty)
 	struct task_struct *g, *p;
 	struct pid *session;
 	int		i;
+	unsigned long flags;
 
 	if (!tty)
 		return;
-	session = tty->session;
+
+	spin_lock_irqsave(&tty->ctrl_lock, flags);
+	session = get_pid(tty->session);
+	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
 
 	tty_ldisc_flush(tty);
 
@@ -2774,6 +2794,7 @@ void __do_SAK(struct tty_struct *tty)
 		task_unlock(p);
 	} while_each_thread(g, p);
 	read_unlock(&tasklist_lock);
+	put_pid(session);
 #endif
 }
 

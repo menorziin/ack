@@ -19,6 +19,10 @@
 #include <linux/interrupt.h>
 #include <linux/wakeup_reason.h>
 #include <trace/events/power.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/irqdesc.h>
+#include <linux/wakeup_reason.h>
 
 #include "power.h"
 
@@ -863,8 +867,9 @@ void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
 	struct wakeup_source *ws, *last_active_ws = NULL;
 	int len = 0;
 	bool active = false;
+	int srcuidx;
 
-	rcu_read_lock();
+	srcuidx = srcu_read_lock(&wakeup_srcu);
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (ws->active && len < max) {
 			if (!active)
@@ -885,7 +890,7 @@ void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
 				"Last active Wakeup Source: %s",
 				last_active_ws->name);
 	}
-	rcu_read_unlock();
+	srcu_read_unlock(&wakeup_srcu, srcuidx);
 }
 EXPORT_SYMBOL_GPL(pm_get_active_wakeup_sources);
 
@@ -898,7 +903,7 @@ void pm_print_active_wakeup_sources(void)
 	srcuidx = srcu_read_lock(&wakeup_srcu);
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (ws->active) {
-			pr_debug("active wakeup source: %s\n", ws->name);
+			pr_info("active wakeup source: %s\n", ws->name);
 			active = 1;
 		} else if (!active &&
 			   (!last_activity_ws ||
@@ -909,7 +914,7 @@ void pm_print_active_wakeup_sources(void)
 	}
 
 	if (!active && last_activity_ws)
-		pr_debug("last active wakeup source: %s\n",
+		pr_info("last active wakeup source: %s\n",
 			last_activity_ws->name);
 	srcu_read_unlock(&wakeup_srcu, srcuidx);
 }
@@ -970,19 +975,22 @@ void pm_wakeup_clear(bool reset)
 
 void pm_system_irq_wakeup(unsigned int irq_number)
 {
+	struct irq_desc *desc;
+	const char *name = "null";
+
 	if (pm_wakeup_irq == 0) {
-		struct irq_desc *desc;
-		const char *name = "null";
+		if (msm_show_resume_irq_mask) {
+			desc = irq_to_desc(irq_number);
+			if (desc == NULL)
+				name = "stray irq";
+			else if (desc->action && desc->action->name)
+				name = desc->action->name;
 
-		desc = irq_to_desc(irq_number);
-		if (desc == NULL)
-			name = "stray irq";
-		else if (desc->action && desc->action->name)
-			name = desc->action->name;
+			pr_warn("%s: %d triggered %s\n", __func__,
+					irq_number, name);
 
+		}
 		log_irq_wakeup_reason(irq_number);
-		pr_warn("%s: %d triggered %s\n", __func__, irq_number, name);
-
 		pm_wakeup_irq = irq_number;
 		pm_system_wakeup();
 	}
@@ -1150,6 +1158,33 @@ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
 	print_wakeup_source_stats(m, &deleted_ws);
 
 	return 0;
+}
+
+int wakelock_dump_active_info(char *buf, int size)
+{
+	struct wakeup_source *ws;
+	unsigned long flags;
+	char *p = buf;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+		spin_lock_irqsave(&ws->lock, flags);
+		if (ws->active) {
+			if (time_after(ws->timer_expires, jiffies)) {
+				long timeout = ws->timer_expires - jiffies;
+
+				p += snprintf(p, size - (p - buf),
+				"   (active)[%s], time left %d (msecs)\n",
+				ws->name, jiffies_to_msecs(timeout));
+			} else /* active */
+				p += snprintf(p, size - (p - buf),
+				"   (active)[%s]\n", ws->name);
+		}
+		spin_unlock_irqrestore(&ws->lock, flags);
+	}
+	rcu_read_unlock();
+
+	return p - buf;
 }
 
 static int wakeup_sources_stats_open(struct inode *inode, struct file *file)
